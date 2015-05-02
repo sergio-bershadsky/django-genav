@@ -1,7 +1,17 @@
 import re
 
+from django.conf.urls import url, patterns
+from django.core.urlresolvers import reverse as dango_reverse
+
 from . import utils
 from . import settings
+
+
+__all__ = \
+    [ 'NavigationModel'
+    , 'get_url_conf'
+    , 'reverse'
+    ]
 
 
 class NavigationManager(object):
@@ -21,12 +31,6 @@ class NavigationManager(object):
         return getattr(self.navigation_class, name, None) or default
 
     @property
-    def id(self):
-        ancestors = [parent.name for parent in self.ancestors]
-        ancestors.reverse()
-        return '.'.join(ancestors + [self.name])
-
-    @property
     def name(self):
         return self.meta('name') or (utils.camel_to_under(self.view_class.__name__).replace('_view', ''))
 
@@ -38,10 +42,20 @@ class NavigationManager(object):
         return result
 
     @property
+    def parent_view(self):
+        result = self.meta('parent')
+        if type(result) is str:
+            view_path = result.split('.')[:2]
+            if len(view_path) == 2:
+                result = utils.get_view(*view_path)
+            else:
+                return None
+        return result
+
+    @property
     def parent(self):
-        parent = self.meta('parent')
-        if parent:
-            return self.meta('parent').nav
+        if self.parent_view:
+            return getattr(self.parent_view, settings.VIEW_NAVIGATION_ATTRIBUTE, None)
         return None
 
     @property
@@ -56,17 +70,8 @@ class NavigationManager(object):
     @property
     def args_all(self):
         result = []
-        parent = self.parent
-        if not parent:
-            return self.args
-        else:
-            parent_args = parent.args_all
-            for parent_arg in parent_args:
-                if self.args:
-                    for self_arg in self.args:
-                        result.append(parent_arg + self_arg)
-                else:
-                    return parent_args
+        for url_pattern in self.url_patterns:
+            result.append(self.get_compiled_pattern(url_pattern).groupindex.keys())
         return result
 
     @property
@@ -80,18 +85,29 @@ class NavigationManager(object):
         else:
             for parent_url_pattern in parent.url_patterns:
                 for self_url_pattern in self.meta('url'):
+                    # pass filtered by ars url patterns
                     if url_exclude_with_args:
                         all_keys = set\
-                            ( self.get_compiled_pattern(parent_url_pattern).groupindex.keys() +
-                              self.get_compiled_pattern(self_url_pattern).groupindex.keys()
+                            ( self.get_compiled_pattern(parent_url_pattern.rstrip('$') + self_url_pattern).groupindex.keys()
                             )
                         if all_keys & set(url_exclude_with_args):
                             continue
+
+                    # add from root
                     if self_url_pattern.startswith('/'):
                         result.append(self_url_pattern)
+
+                    # append to parent's ur;
                     else:
-                        result.append(parent_url_pattern + self_url_pattern)
-        return result
+                        result.append(parent_url_pattern.rstrip('$') + self_url_pattern)
+
+        return map(self.prepare_url_pattern, result)
+
+    def prepare_url_pattern(self, url_pattern):
+        url_pattern = url_pattern.lstrip('/')
+        url_pattern = '^' + url_pattern.lstrip('^')
+        url_pattern = url_pattern.rstrip('$') + '$'
+        return url_pattern
 
     def get_compiled_pattern(self, url_pattern):
         return self._patterns_cache.get(url_pattern) or \
@@ -99,15 +115,15 @@ class NavigationManager(object):
 
     def get_url_by_args(self, *args):
         args = set(args)
-        match = list()
+        match = list((None, None, 0))
         for url_pattern in self.url_patterns:
             url_pattern_args = set(self.get_compiled_pattern(url_pattern).groupindex.keys())
             if url_pattern_args <= args:
                 match.append((url_pattern, url_pattern_args, len(url_pattern_args & args)))
-        best_match = max(match, key=lambda v: v[2])
-        return best_match[0], best_match[1]
+        url_pattern, url_pattern_args, score = max(match, key=lambda v: v[2])
+        return url_pattern, url_pattern_args
 
-    def url_reverse(self, **kwargs):
+    def reverse(self, **kwargs):
         requested_args = set(kwargs.keys())
         best_match = set()
         for arg_set in self.args_all:
@@ -116,7 +132,35 @@ class NavigationManager(object):
                 matched_args = requested_args & arg_set
                 if len(matched_args) > len(best_match):
                     best_match = matched_args
-        return {k: v for k, v in kwargs.iteritems() if k in best_match}
+        kwargs = {k: v for k, v in kwargs.iteritems() if k in best_match}
+        return dango_reverse(self.name, kwargs=kwargs)
+
+    def back(self):
+        if not self.view:
+            raise ValueError('View instance is required for this operation')
+
+        # if view implements it's own method to resolve back_url
+        get_back_url = getattr(self.view, 'get_back_url', None)
+
+        if get_back_url:
+            return get_back_url()
+
+        # Try to resolve with given data
+        if self.parent:
+            return self.parent.reverse(**self.view.kwargs)
+
+        # Or there are no back_url at all
+        return None
+
+    @property
+    def url_conf(self):
+        result = []
+        for url_pattern in self.url_patterns:
+            view = self.view_class
+            if hasattr(view, 'as_view'):
+                view = view.as_view()
+            result.append(url(url_pattern, view, name=self.name))
+        return result
 
 
 class NavigationProxy(object):
@@ -133,25 +177,49 @@ class NavigationProxy(object):
         return res
 
 
+_registry = dict()
+
+
 class NavigationModelMeta(type):
 
-    _registry = dict()
-
     def __new__(mcs, name, bases, attributes):
+        global _registry
         result = super(NavigationModelMeta, mcs).__new__(mcs, name, bases, attributes)
         if object not in bases and NavigationModel in bases:
-            view = attributes.get('view') or None
-            if view is None:
+            view_class = attributes.get('view') or None
+            if view_class is None:
                 raise NotImplementedError\
                     ('Navigation view attribute must be defined')
-            setattr(view, settings.VIEW_NAVIGATION_ATTRIBUTE, NavigationProxy(result))
-            name = view.nav.name
-            registry_view = mcs._registry.setdefault(name, view)
-            if registry_view != view:
+
+            if not type(view_class) is type:
+                raise ValueError('It is senselessly to make descriptor work with instance not type objects')
+
+            setattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, NavigationProxy(result))
+
+            name = getattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE).name
+            registry_view = _registry.setdefault(name, view_class)
+            if registry_view != view_class:
                 raise ValueError\
-                    ('View name "%s" for "%s" already registered, choose another.' % (name, view))
+                    ('View name "%s" for "%s" already registered, choose another.' % (name, view_class))
         return result
 
 
 class NavigationModel(object):
     __metaclass__ = NavigationModelMeta
+
+
+def get_url_conf():
+    result = ['', ]
+    for name, item in _registry.iteritems():
+        manager = getattr(item, settings.VIEW_NAVIGATION_ATTRIBUTE, None)
+        if manager:
+            result.extend(manager.url_conf)
+    return patterns(*result)
+
+
+def reverse(name_or_view_class, **kwargs):
+    view_class = _registry.get(name_or_view_class) or name_or_view_class
+    manager = getattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, None)
+    if not manager:
+        return dango_reverse(name_or_view_class, kwargs=kwargs)
+    return manager.reverse(**kwargs)
