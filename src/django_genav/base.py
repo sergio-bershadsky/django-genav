@@ -5,6 +5,7 @@ from django.core.urlresolvers import reverse as dango_reverse
 
 from . import utils
 from . import settings
+from django_genav.utils import dict_copy
 
 
 __all__ = \
@@ -81,6 +82,10 @@ class NavigationManager(object):
         url_exclude_with_args = self.meta('url_exclude_with_args')
 
         if not parent:
+            url = self.meta('url')
+            if type(url) is str:
+                raise ValueError\
+                    ('Strings are forbidden for url attribute maybe you forgot comma in brackets? url = ("%s", )' % url)
             result = self.meta('url')[:]
         else:
             for parent_url_pattern in parent.url_patterns:
@@ -123,17 +128,48 @@ class NavigationManager(object):
         url_pattern, url_pattern_args, score = max(match, key=lambda v: v[2])
         return url_pattern, url_pattern_args
 
-    def reverse(self, **kwargs):
+    def reverse(self, name_or_view=None, kwargs=None):
+        """
+        View.nav.reverse(kwargs={...})
+            - reverse through itself with given kwargs
+
+        View().nav.reverse()
+            - reverse self using it self kwargs
+
+        View().nav.reverse(kwargs={...})
+            - reverse self using it self kwargs merging with given kwargs
+
+        View().nav.reverse('another.view.name')
+            - reverse another view using it self kwargs
+
+        View().nav.reverse('another.view.name', kwargs={...})
+            - reverse another view using it self kwargs merging with given kwargs
+        """
+        if name_or_view and not self.view:
+            raise NotImplementedError('')
+
+        # Merging kwargs
+        kwargs = kwargs or {}
+        view_kwargs = dict_copy(getattr(self.view, 'kwargs', None) or {})
+        view_kwargs.update(kwargs)
+        kwargs = view_kwargs
+
+        # Resolve view name
+        view_class = _registry.get(name_or_view) or name_or_view or self
+        manager = getattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, None) or self
+        name = getattr(manager, 'name', None) or self.name
+
+        # Trying to guess best kwarg combination
         requested_args = set(kwargs.keys())
         best_match = set()
-        for arg_set in self.args_all:
+        for arg_set in manager.args_all:
             arg_set = set(arg_set)
             if arg_set <= requested_args:
                 matched_args = requested_args & arg_set
                 if len(matched_args) > len(best_match):
                     best_match = matched_args
         kwargs = {k: v for k, v in kwargs.iteritems() if k in best_match}
-        return dango_reverse(self.name, kwargs=kwargs)
+        return dango_reverse(name, kwargs=kwargs)
 
     def back(self):
         if not self.view:
@@ -147,7 +183,7 @@ class NavigationManager(object):
 
         # Try to resolve with given data
         if self.parent:
-            return self.parent.reverse(**self.view.kwargs)
+            return self.parent.reverse(kwargs=self.view.kwargs)
 
         # Or there are no back_url at all
         return None
@@ -192,7 +228,7 @@ class NavigationModelMeta(type):
                     ('Navigation view attribute must be defined')
 
             if not type(view_class) is type:
-                raise ValueError('It is senselessly to make descriptor work with instance not type objects')
+                raise ValueError('It is senselessly to make descriptor work with instance of "%s" not type objects' % view_class)
 
             setattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, NavigationProxy(result))
 
@@ -217,9 +253,10 @@ def get_url_conf():
     return patterns(*result)
 
 
-def reverse(name_or_view_class, **kwargs):
+def reverse(name_or_view_class, kwargs=None):
+    kwargs = kwargs or {}
     view_class = _registry.get(name_or_view_class) or name_or_view_class
     manager = getattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, None)
     if not manager:
         return dango_reverse(name_or_view_class, kwargs=kwargs)
-    return manager.reverse(**kwargs)
+    return manager.reverse(kwargs=kwargs)
