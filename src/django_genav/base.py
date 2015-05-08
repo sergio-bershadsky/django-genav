@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import re
 
 from django.conf.urls import url, patterns
@@ -11,6 +12,7 @@ from django_genav.utils import dict_copy
 __all__ = \
     [ 'NavigationModel'
     , 'get_url_conf'
+    , 'print_url_conf'
     , 'reverse'
     ]
 
@@ -22,6 +24,17 @@ class NavigationManager(object):
     navigation_class = None
 
     _patterns_cache = dict()
+
+
+    def __repr__(self):
+        return self._repr()
+
+    def _repr(self, indent=0):
+        result = (' ' * 4 * indent) + self.name + '\n'
+        descendants = self.get_descendants() or {}
+        for view_class, children_view_class in descendants.iteritems():
+            result += view_class.nav._repr(indent=indent+1)
+        return result
 
     def __init__(self, view, view_class, navigation_class):
         self.view = view
@@ -88,6 +101,7 @@ class NavigationManager(object):
                     ('Strings are forbidden for url attribute maybe you forgot comma in brackets? url = ("%s", )' % url)
             result = self.meta('url')[:]
         else:
+
             for parent_url_pattern in parent.url_patterns:
                 for self_url_pattern in self.meta('url'):
                     # pass filtered by ars url patterns
@@ -106,7 +120,7 @@ class NavigationManager(object):
                     else:
                         result.append(parent_url_pattern.rstrip('$') + self_url_pattern)
 
-        return map(self.prepare_url_pattern, result)
+        return map(self.prepare_url_pattern, utils.unique(result))
 
     def prepare_url_pattern(self, url_pattern):
         url_pattern = url_pattern.lstrip('/')
@@ -198,6 +212,25 @@ class NavigationManager(object):
             result.append(url(url_pattern, view, name=self.name))
         return result
 
+    def get_descendants(self):
+        global _registry
+        result = OrderedDict()
+        children = self.get_children()
+        if children:
+            for view_class in children:
+                result[view_class] = view_class.nav.get_children()
+        else:
+            return None
+        return result
+
+    def get_children(self):
+        global _registry
+        result = []
+        for name, view_class in _registry.items():
+            if utils.getattr_deep(view_class, 'nav', 'parent', 'name') == self.name:
+                result.append(view_class)
+        return sorted(result, key=lambda v: v.nav.name)
+
 
 class NavigationProxy(object):
 
@@ -251,6 +284,12 @@ def get_url_conf():
         if manager:
             result.extend(manager.url_conf)
     return patterns(*result)
+
+
+def print_url_conf():
+    for name, item in _registry.iteritems():
+        if item.nav.parent is None:
+            print item.nav
 
 
 def reverse(name_or_view_class, kwargs=None):
