@@ -1,12 +1,13 @@
-from collections import OrderedDict
 import re
+
+from collections import OrderedDict
 
 from django.conf.urls import url, patterns
 from django.core.urlresolvers import reverse as dango_reverse
+from django_genav.utils import dict_copy
 
 from . import utils
 from . import settings
-from django_genav.utils import dict_copy
 
 
 __all__ = \
@@ -68,18 +69,51 @@ class NavigationManager(object):
 
     @property
     def parent(self):
+        return self.get_parent()
+
+    def get_parent(self):
         if self.parent_view:
             return getattr(self.parent_view, settings.VIEW_NAVIGATION_ATTRIBUTE, None)
         return None
 
     @property
     def ancestors(self):
-        result = list()
+        return self.get_ancestors()
+
+    def get_ancestors(self):
+        result = []
         parent = self.parent
         while parent:
             result.append(parent)
             parent = parent.parent
         return result
+
+    @property
+    def descendants(self):
+        return self.get_descendants()
+
+    def get_descendants(self):
+        global _registry
+        result = OrderedDict()
+        children = self.get_children()
+        if children:
+            for view_class in children:
+                result[view_class] = view_class.nav.get_children()
+        else:
+            return None
+        return result
+
+    @property
+    def children(self):
+        return self.get_children()
+
+    def get_children(self):
+        global _registry
+        result = []
+        for name, view_class in _registry.items():
+            if utils.getattr_deep(view_class, 'nav', 'parent', 'name') == self.name:
+                result.append(view_class)
+        return sorted(result, key=lambda v: v.nav.name)
 
     @property
     def args_all(self):
@@ -142,7 +176,7 @@ class NavigationManager(object):
         url_pattern, url_pattern_args, score = max(match, key=lambda v: v[2])
         return url_pattern, url_pattern_args
 
-    def reverse(self, name_or_view=None, kwargs=None):
+    def reverse(self, name_or_view=None, kwargs=None, exclude=None):
         """
         View.nav.reverse(kwargs={...})
             - reverse through itself with given kwargs
@@ -168,6 +202,10 @@ class NavigationManager(object):
         view_kwargs.update(kwargs)
         kwargs = view_kwargs
 
+        if exclude:
+            for key in exclude:
+                kwargs.pop(key, None)
+
         # Resolve view name
         view_class = _registry.get(name_or_view) or name_or_view or self
         manager = getattr(view_class, settings.VIEW_NAVIGATION_ATTRIBUTE, None) or self
@@ -191,9 +229,15 @@ class NavigationManager(object):
 
         # if view implements it's own method to resolve back_url
         get_back_url = getattr(self.view, 'get_back_url', None)
-
         if get_back_url:
             return get_back_url()
+
+        # if Navigation class implements get_back
+        get_back = self.meta('back')
+        if callable(get_back):
+            result = get_back(self.view)
+            if result is not None:
+                return result
 
         # Try to resolve with given data
         if self.parent:
@@ -211,25 +255,6 @@ class NavigationManager(object):
                 view = view.as_view()
             result.append(url(url_pattern, view, name=self.name))
         return result
-
-    def get_descendants(self):
-        global _registry
-        result = OrderedDict()
-        children = self.get_children()
-        if children:
-            for view_class in children:
-                result[view_class] = view_class.nav.get_children()
-        else:
-            return None
-        return result
-
-    def get_children(self):
-        global _registry
-        result = []
-        for name, view_class in _registry.items():
-            if utils.getattr_deep(view_class, 'nav', 'parent', 'name') == self.name:
-                result.append(view_class)
-        return sorted(result, key=lambda v: v.nav.name)
 
 
 class NavigationProxy(object):
@@ -287,9 +312,9 @@ def get_url_conf():
 
 
 def print_url_conf():
-    for name, item in _registry.iteritems():
-        if item.nav.parent is None:
-            print item.nav
+    for name, view_class in sorted(_registry.iteritems(), key=lambda v: v[0]):
+        if view_class.nav.parent is None:
+            print view_class.nav
 
 
 def reverse(name_or_view_class, kwargs=None):

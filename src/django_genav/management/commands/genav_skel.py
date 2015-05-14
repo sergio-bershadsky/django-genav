@@ -54,7 +54,7 @@ class {class_name}(NavigationModel):
             for member_name in sorted(dir(view_module)):
                 if not member_name.startswith('_'):
                     member = getattr(view_module, member_name)
-                    if type(member) is type and issubclass(member, View):
+                    if type(member) is type and issubclass(member, View) and member is not View:
                         view_class_path = '.'.join([member.__module__, member.__name__])
                         views[view_class_path] = member
 
